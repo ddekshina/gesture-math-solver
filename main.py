@@ -24,6 +24,7 @@ Draw math expressions with hand gestures and get instant solutions!
 if "points" not in st.session_state:
     st.session_state.update({
         "points": [],
+        "drawing_mode": False,  # Track if we're actively drawing
         "expression": "",
         "result": "",
         "last_action": None,
@@ -32,7 +33,11 @@ if "points" not in st.session_state:
         "api_key": "",
         "debug_mode": False,
         "model_loaded": False,
-        "label_map": None
+        "label_map": None,
+        "last_tip_pos": None,  # Store last position for interpolation
+        "smoothing_points": [],
+        "stroke_width": 15,    # Line thickness
+        "min_distance": 5      # Minimum distance to record new point
     })
 
 # Setup columns
@@ -74,6 +79,45 @@ def load_model():
         st.error(f"Error loading model: {str(e)}")
         return None, None
 
+# Helper function to add points with interpolation for smoother lines
+def add_drawing_point(point):
+    """Add point with improved interpolation for smoother drawing"""
+    if point is None:
+        st.session_state.points.append(None)
+        st.session_state.last_tip_pos = None
+        return
+    
+    # If this is the first point or after a pen lift
+    if st.session_state.last_tip_pos is None:
+        st.session_state.points.append(point)
+        st.session_state.last_tip_pos = point
+        return
+    
+    # Calculate distance between current and last point
+    last_x, last_y = st.session_state.last_tip_pos
+    curr_x, curr_y = point
+    distance = np.sqrt((curr_x - last_x)**2 + (curr_y - last_y)**2)
+    
+    # If points are too close, skip to avoid jitter
+    if distance < 3:  # Fixed smaller threshold
+        return
+    
+    # If distance is large, use linear interpolation with more points
+    if distance > 10:  # Lower threshold for smoother curves
+        # Add many intermediate points for very smooth lines
+        steps = max(int(distance / 5), 2)  # At least 2 steps for any significant movement
+        
+        # Simple linear interpolation (more reliable than complex curves)
+        for i in range(1, steps + 1):
+            t = i / (steps + 1)
+            inter_x = int(last_x + t * (curr_x - last_x))
+            inter_y = int(last_y + t * (curr_y - last_y))
+            st.session_state.points.append((inter_x, inter_y))
+    
+    # Add the current point
+    st.session_state.points.append(point)
+    st.session_state.last_tip_pos = point
+    
 # Initialize model
 model, label_map = load_model()
 st.session_state.model_loaded = model is not None
@@ -86,11 +130,16 @@ with st.sidebar:
     # Camera control
     activate = st.checkbox("🎥 Activate Camera", value=True)
     
+    # Drawing settings
+    st.session_state.stroke_width = st.slider("Stroke Width", 5, 25, st.session_state.stroke_width)
+    st.session_state.min_distance = st.slider("Drawing Sensitivity", 1, 15, st.session_state.min_distance)
+    
     # Action buttons
     if st.button("🧹 Clear Canvas"):
         st.session_state.points = []
         st.session_state.expression = ""
         st.session_state.result = ""
+        st.session_state.last_tip_pos = None
     
     # Gemini API settings
     st.session_state.use_gemini = st.checkbox("Use Gemini AI for step-by-step solutions", value=False)
@@ -118,13 +167,20 @@ with st.sidebar:
         else:
             try:
                 # Create dataset directory if it doesn't exist
-                dataset_path = os.path.join("dataset", sample_label)
+                if sample_label == '*':
+                    dir_label = 'x'
+                elif sample_label == '/':
+                    dir_label = 'divide'
+                else:
+                    dir_label = sample_label
+                
+                dataset_path = os.path.join("dataset", dir_label)
                 os.makedirs(dataset_path, exist_ok=True)
                 
                 # Process and save the current drawing
                 h, w = 480, 640  # Default canvas size
                 canvas = create_canvas(h, w)
-                canvas = draw_strokes(canvas, st.session_state.points)
+                canvas = draw_strokes(canvas, st.session_state.points, thickness=st.session_state.stroke_width)
                 
                 # Extract the drawing
                 points_array = [p for p in st.session_state.points if p is not None]
@@ -160,6 +216,10 @@ with st.sidebar:
                         save_file = os.path.join(dataset_path, f"{count:03d}.png")
                         cv2.imwrite(save_file, resized)
                         st.success(f"Sample saved as {save_file}")
+                        
+                        # Show preview
+                        preview = cv2.resize(resized, (112, 112))
+                        st.image(preview, caption=f"Sample: {sample_label}")
             except Exception as e:
                 st.error(f"Error saving sample: {str(e)}")
 
@@ -181,14 +241,22 @@ with col2:
                 )
             else:
                 st.session_state.result = solve_expression(st.session_state.expression)
+    
+    # Canvas display
+    st.markdown("### 🎨 Canvas Preview")
+    if len(st.session_state.points) > 0:
+        h, w = 240, 320  # Smaller preview size
+        preview_canvas = create_canvas(h, w)
+        preview_canvas = draw_strokes(preview_canvas, st.session_state.points, thickness=st.session_state.stroke_width)
+        st.image(preview_canvas, caption="Drawing Canvas")
                 
     # Debug information if enabled
     if st.session_state.debug_mode:
         st.markdown("### 🔍 Debug Info")
         st.write(f"Last Gesture: {st.session_state.last_gesture}")
+        st.write(f"Drawing Mode: {st.session_state.drawing_mode}")
         st.write(f"Points Count: {len(st.session_state.points)}")
         st.write(f"Model Loaded: {st.session_state.model_loaded}")
-        st.write(f"Label Map: {st.session_state.label_map}")
 
 # Main processing loop when camera is active
 if activate and st.session_state.model_loaded:
@@ -229,19 +297,30 @@ if activate and st.session_state.model_loaded:
                 # Get index finger tip position
                 index_tip = hand_detector.get_index_finger_tip(frame)
                 if index_tip:
-                    st.session_state.points.append(index_tip)
-                    st.session_state.last_action = "drawing"
+                    if not st.session_state.drawing_mode:
+                        # Started drawing - add None for a new stroke
+                        st.session_state.points.append(None)
+                        st.session_state.drawing_mode = True
+                        
+                    # Add point with interpolation for smoother drawing
+                    add_drawing_point(index_tip)
+
+                st.session_state.last_action = "drawing"
                     
-            elif action == "lift_pen" and st.session_state.last_action == "drawing":
-                # Add None to separate strokes
-                st.session_state.points.append(None)
+            elif action == "lift_pen" and st.session_state.drawing_mode :
+                # Lift pen only if we were drawing
+                st.session_state.points.append(None)  # End the current stroke
+                st.session_state.drawing_mode = False
+                st.session_state.last_tip_pos = None  # Reset last position
                 st.session_state.last_action = "lifting"
-                
+    
             elif action == "clear":
                 # Clear the canvas
                 st.session_state.points = []
                 st.session_state.expression = ""
                 st.session_state.result = ""
+                st.session_state.last_tip_pos = None
+                st.session_state.drawing_mode = False
                 st.session_state.last_action = "clearing"
                 
             elif action == "solve" and st.session_state.last_action != "solving":
@@ -249,7 +328,7 @@ if activate and st.session_state.model_loaded:
                 if len(st.session_state.points) > 0:
                     # Update the canvas
                     canvas = create_canvas(h, w)
-                    canvas = draw_strokes(canvas, st.session_state.points)
+                    canvas = draw_strokes(canvas, st.session_state.points, thickness=st.session_state.stroke_width)
                     
                     # Process for segment recognition
                     segments = process_canvas_for_segmentation(canvas, st.session_state.points)
@@ -286,7 +365,12 @@ if activate and st.session_state.model_loaded:
                     
             # Update canvas with current strokes
             canvas = create_canvas(h, w)
-            canvas = draw_strokes(canvas, st.session_state.points)
+            canvas = draw_strokes(canvas, st.session_state.points, thickness=st.session_state.stroke_width)
+            
+            # Add visual cues for index finger when drawing
+            if st.session_state.drawing_mode and hand_detector.get_index_finger_tip(frame):
+                tip_pos = hand_detector.get_index_finger_tip(frame)
+                cv2.circle(frame, tip_pos, st.session_state.stroke_width//2, (0, 0, 255), -1)  # Red dot at fingertip
             
             # Add debug info to frame
             if st.session_state.debug_mode:
@@ -314,21 +398,32 @@ if activate and st.session_state.model_loaded:
                         (0, 255, 0), 
                         2
                     )
+                
+                # Drawing mode indicator
+                cv2.putText(
+                    frame,
+                    f"Drawing: {'ON' if st.session_state.drawing_mode else 'OFF'}",
+                    (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0) if st.session_state.drawing_mode else (0, 0, 255),
+                    2
+                )
             
             # Combine frame and canvas for display
             canvas_rgb = cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
-            alpha = 0.3
+            alpha = 0.4  # Increased opacity for better visibility
             overlay = cv2.addWeighted(frame, 1-alpha, canvas_rgb, alpha, 0)
             
             # Display side by side
-            combined = np.hstack([frame, canvas_rgb])
+            combined = np.hstack([overlay, canvas_rgb])
             FRAME_WINDOW.image(combined, channels="BGR")
             
             # Update UI elements
-            expr_display.code(st.session_state.expression)
-            result_display.code(st.session_state.result)
-            
-        # Release camera when done
+        expr_display.code(st.session_state.expression)
+        result_display.code(st.session_state.result)
+    
+            # Release camera when done
         cap.release()
         
     except Exception as e:

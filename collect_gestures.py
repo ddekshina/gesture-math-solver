@@ -2,6 +2,8 @@ import cv2
 import os
 import numpy as np
 import mediapipe as mp
+import collections
+from scipy.interpolate import splprep, splev
 
 # Initialize MediaPipe hands
 mp_hands = mp.solutions.hands
@@ -32,6 +34,52 @@ cap = cv2.VideoCapture(0)
 drawing = False
 points = []
 canvas = None
+
+# Add smoothing buffers
+position_history = collections.deque(maxlen=5)  # Stores recent positions for smoothing
+drawing_points = []  # Stores points for current gesture
+
+def get_smoothed_position(new_position):
+    """
+    Apply smoothing to hand positions using a moving average
+    """
+    if new_position is None:
+        return None
+        
+    position_history.append(new_position)
+    
+    if len(position_history) < 2:
+        return new_position
+    
+    # Calculate weighted average (recent positions have higher weight)
+    weights = np.linspace(0.5, 1.0, len(position_history))
+    weights = weights / np.sum(weights)
+    
+    x_avg = int(sum(p[0] * w for p, w in zip(position_history, weights)))
+    y_avg = int(sum(p[1] * w for p, w in zip(position_history, weights)))
+    
+    return (x_avg, y_avg)
+
+def smooth_path(points, smoothing=0.35):
+    """
+    Apply spline interpolation to smooth a drawing path
+    """
+    if len(points) < 4:
+        return points
+        
+    # Extract x and y coordinates
+    x_coords = [p[0] for p in points]
+    y_coords = [p[1] for p in points]
+    
+    # Fit spline to points
+    tck, u = splprep([x_coords, y_coords], s=smoothing, k=3)
+    
+    # Generate new points (increase density for smoother curves)
+    u_new = np.linspace(0, 1, len(points) * 2)
+    smoothed = splev(u_new, tck)
+    
+    # Convert back to list of tuples
+    return list(zip(map(int, smoothed[0]), map(int, smoothed[1])))
 
 # Instructions
 instructions = [
@@ -66,14 +114,20 @@ while True:
             if drawing:
                 index_tip = hand_landmarks.landmark[8]
                 x, y = int(index_tip.x * w), int(index_tip.y * h)
-                points.append((x, y))
+                smooth_pos = get_smoothed_position((x, y))
+                if smooth_pos:
+                    points.append(smooth_pos)
+                    drawing_points.append(smooth_pos)  # Store for current drawing only
     
-    # Draw the current stroke
+    # Draw the current stroke with smoothing for visualization
     if len(points) > 1:
-        for i in range(1, len(points)):
-            pt1, pt2 = points[i-1], points[i]
-            cv2.line(canvas, pt1, pt2, 0, 10)  # Black on white
-            cv2.line(frame, pt1, pt2, (0, 0, 255), 2)  # Red on camera
+        # Apply smoothing to visualize smoothly
+        smoothed_points = smooth_path(points) if len(points) > 3 else points
+        
+        for i in range(1, len(smoothed_points)):
+            pt1, pt2 = smoothed_points[i-1], smoothed_points[i]
+            cv2.line(canvas, pt1, pt2, 0, 10, lineType=cv2.LINE_AA)  # Anti-aliased lines
+            cv2.line(frame, pt1, pt2, (0, 0, 255), 2, lineType=cv2.LINE_AA)
     
     # Show canvas overlay on frame
     canvas_display = cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
@@ -91,13 +145,15 @@ while True:
     
     if key == ord('d'):
         drawing = True
-        points = []
-    elif key == ord('s') and points:
+        # Clear point history for new drawing
+        position_history.clear()
+        drawing_points = []
+    elif key == ord('s') and drawing_points:
         # Process the canvas for saving
-        if len(points) > 0:
+        if len(drawing_points) > 0:
             # Get bounding box of the drawing
-            x_vals = [p[0] for p in points]
-            y_vals = [p[1] for p in points]
+            x_vals = [p[0] for p in drawing_points]
+            y_vals = [p[1] for p in drawing_points]
             padding = 20
             
             xmin = max(0, min(x_vals) - padding)
@@ -119,25 +175,35 @@ while True:
                 x_offset = (size - w_crop) // 2
                 squared[y_offset:y_offset+h_crop, x_offset:x_offset+w_crop] = cropped
                 
-                # Resize to 28x28
+                # Resize to 28x28 with anti-aliasing
                 resized = cv2.resize(squared, (28, 28), interpolation=cv2.INTER_AREA)
+                
+                # Apply slight Gaussian blur for noise reduction
+                resized = cv2.GaussianBlur(resized, (3, 3), 0)
+                
+                # Enhance contrast if needed
+                _, binary = cv2.threshold(resized, 200, 255, cv2.THRESH_BINARY)
                 
                 # Save the image
                 count = len(os.listdir(save_path))
                 save_file = os.path.join(save_path, f"{count:03d}.png")
-                cv2.imwrite(save_file, resized)
+                cv2.imwrite(save_file, binary)
                 print(f"Saved {save_file}")
                 
                 # Show the processed image
-                cv2.imshow("Saved Image", cv2.resize(resized, (112, 112)))
+                cv2.imshow("Saved Image", cv2.resize(binary, (112, 112)))
         
         # Reset for next drawing
         canvas = np.ones((h, w), dtype=np.uint8) * 255
         points = []
+        drawing_points = []
+        position_history.clear()
         drawing = False
     elif key == ord('c'):
         canvas = np.ones((h, w), dtype=np.uint8) * 255
         points = []
+        drawing_points = []
+        position_history.clear()
         drawing = False
     elif key == ord('q'):
         break

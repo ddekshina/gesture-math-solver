@@ -118,9 +118,63 @@ class HandDetector:
         
         return fingers_up
     
+    def is_pointing(self, hand_landmarks):
+        """Detects if the index finger is pointing (drawing mode)."""
+        landmarks = hand_landmarks.landmark
+        index_tip = landmarks[8]  # INDEX_FINGER_TIP
+        index_mcp = landmarks[5]  # INDEX_FINGER_MCP
+
+        other_finger_tips = [landmarks[12], landmarks[16], landmarks[20]]  # MIDDLE, RING, PINKY tips
+        other_finger_mcps = [landmarks[9], landmarks[13], landmarks[17]]  # MIDDLE, RING, PINKY MCPs
+
+        index_extended = index_tip.y < index_mcp.y - 0.05
+        others_fully_curled = all(tip.y > mcp.y + 0.02 for tip, mcp in zip(other_finger_tips, other_finger_mcps))
+        index_above_others = all(index_tip.y < tip.y - 0.02 for tip in other_finger_tips)
+
+        return index_extended and others_fully_curled and index_above_others
+
+    def is_palm_open(self, hand_landmarks):
+        """Detects if the palm is open (lift pen mode)."""
+        landmarks = hand_landmarks.landmark
+        fingers = [
+            (8, 5),  # INDEX_FINGER_TIP, INDEX_FINGER_MCP
+            (12, 9),  # MIDDLE_FINGER_TIP, MIDDLE_FINGER_MCP
+            (16, 13),  # RING_FINGER_TIP, RING_FINGER_MCP
+            (20, 17)  # PINKY_TIP, PINKY_MCP
+        ]
+        open_fingers = sum(1 for tip, mcp in fingers if landmarks[tip].y < landmarks[mcp].y)
+        return open_fingers >= 3  # At least 3 fingers need to be extended
+
+    def is_fist(self, hand_landmarks):
+        """Detects if the hand is in a fist (clear mode)."""
+        landmarks = hand_landmarks.landmark
+        fingers = [
+            (8, 5),  # INDEX_FINGER_TIP, INDEX_FINGER_MCP
+            (12, 9),  # MIDDLE_FINGER_TIP, MIDDLE_FINGER_MCP
+            (16, 13),  # RING_FINGER_TIP, RING_FINGER_MCP
+            (20, 17)  # PINKY_TIP, PINKY_MCP
+        ]
+        curled_fingers = sum(1 for tip, mcp in fingers if landmarks[tip].y > landmarks[mcp].y)
+        return curled_fingers >= 3  # At least 3 fingers need to be curled
+
+    def is_three_fingers_up(self, hand_landmarks):
+        """Detects if three fingers are up (solve mode)."""
+        landmarks = hand_landmarks.landmark
+        
+        # Check if index, middle, and thumb are extended
+        index_up = landmarks[8].y < landmarks[5].y
+        middle_up = landmarks[12].y < landmarks[9].y
+        thumb_up = landmarks[4].x > landmarks[3].x  # For right hand
+        
+        # Check if ring and pinky are down
+        ring_down = landmarks[16].y > landmarks[13].y
+        pinky_down = landmarks[20].y > landmarks[17].y
+        
+        return index_up and middle_up and thumb_up and ring_down and pinky_down
+    
     def get_gesture(self, frame):
         """
-        Recognize common hand gestures
+        Recognize common hand gestures with improved precision
         
         Args:
             frame: Input frame
@@ -129,26 +183,28 @@ class HandDetector:
             gesture: String describing the detected gesture
             action: Recommended action based on gesture
         """
-        fingers = self.get_finger_status(frame)
+        # Get landmarks for more precise gesture detection
+        if not self.results or not self.results.multi_hand_landmarks:
+            return "none", "none"
+            
+        hand_landmarks = self.results.multi_hand_landmarks[0]
         
-        if fingers == [False, False, False, False, False]:
+        # Check for pointing gesture (index finger up, others down)
+        if self.is_pointing(hand_landmarks):
+            return "index_finger", "draw"
+        
+        # Check for open palm gesture
+        elif self.is_palm_open(hand_landmarks):
+            return "open_palm", "lift_pen"
+        
+        # Check for fist gesture
+        elif self.is_fist(hand_landmarks):
             return "fist", "clear"
         
-        elif fingers == [False, True, False, False, False]:
-            return "index_finger", "draw"
-            
-        elif fingers == [True, True, True, False, False]:
+        # Check for three fingers up (solve)
+        elif self.is_three_fingers_up(hand_landmarks):
             return "three_fingers", "solve"
-            
-        elif fingers == [True, True, True, True, True]:
-            return "open_palm", "lift_pen"
-            
-        elif fingers == [True, True, False, False, False]:
-            return "peace", "none"
-            
-        elif fingers == [False, False, False, False, True]:
-            return "pinky", "none"
-            
+        
         else:
             return "unknown", "none"
             

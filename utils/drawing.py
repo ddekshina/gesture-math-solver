@@ -5,6 +5,24 @@ def create_canvas(height, width):
     """Create a blank white canvas"""
     return np.ones((height, width), dtype=np.uint8) * 255
 
+def draw_stroke(canvas, point1, point2, thickness=10):
+    """
+    Draw a line between two points on the canvas
+    
+    Args:
+        canvas: The canvas to draw on
+        point1: First point (x, y)
+        point2: Second point (x, y)
+        thickness: Line thickness
+        
+    Returns:
+        Updated canvas with stroke
+    """
+    if point1 is None or point2 is None:
+        return canvas
+    cv2.line(canvas, point1, point2, 0, thickness)
+    return canvas
+
 def draw_strokes(canvas, points, thickness=10):
     """
     Draw the accumulated strokes on the canvas
@@ -41,6 +59,26 @@ def draw_strokes(canvas, points, thickness=10):
             cv2.line(result, current_stroke[i-1], current_stroke[i], 0, thickness)
             
     return result
+
+def overlay_canvas(frame, canvas, alpha=0.3):
+    """
+    Overlay the drawing canvas on the frame
+    
+    Args:
+        frame: The camera frame
+        canvas: The drawing canvas
+        alpha: Transparency factor (0-1)
+        
+    Returns:
+        Combined frame with canvas overlay
+    """
+    # Convert canvas to BGR for overlay
+    canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
+    
+    # Create an alpha blend
+    overlay = cv2.addWeighted(frame, 1-alpha, canvas_bgr, alpha, 0)
+    
+    return overlay
 
 def process_canvas_for_segmentation(canvas, points):
     """
